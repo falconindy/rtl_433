@@ -4,7 +4,7 @@
 Plays a scripted fake MQTT broker on the loopback interface and runs rtl_433 in
 manual device mode (-D manual), which runs the network event loop without any
 SDR hardware or input file. Each scenario checks that rtl_433 drops a
-connection the broker doesn't accept and reconnects, instead of staying
+connection the broker stops answering and reconnects, instead of staying
 connected-but-silent forever:
 
   connack_timeout   broker accepts the connection but never sends CONNACK
@@ -12,6 +12,10 @@ connected-but-silent forever:
                     close it after ~10 s and reconnect
   connack_rejected  broker rejects every CONNECT: rtl_433 must close at once,
                     and the reconnect delay must back off instead of spinning
+  keepalive         broker accepts, answers one PINGREQ, then goes silent:
+                    rtl_433 must ping every keep_alive/2 (30 s) and close the
+                    connection keep_alive (60 s) after the last response.
+                    Takes about 100 s.
 
 Pure standard library so it runs in CI without extra packages.
 
@@ -28,7 +32,11 @@ import time
 CONNECT = 1
 CONNACK = 2
 PUBLISH = 3
+PINGREQ = 12
+PINGRESP = 13
+DISCONNECT = 14
 
+KEEP_ALIVE = 60  # rtl_433 doesn't set one, so mongoose's default applies
 CONNACK_TIMEOUT = 10
 
 
@@ -201,9 +209,52 @@ def connack_rejected(broker, s):
     )
 
 
+def keepalive(broker, s):
+    conn, _ = connect(broker, s, "connection")
+    if not conn:
+        return
+    try:
+        conn.sendall(bytes([CONNACK << 4, 2, 0, 0]))
+        t_connack = time.monotonic()
+
+        t_ping1 = wait_for(conn, PINGREQ, KEEP_ALIVE)
+        if not s.check(t_ping1 is not None, "pings an idle broker"):
+            return
+        waited = t_ping1 - t_connack
+        s.check(
+            KEEP_ALIVE / 2 - 2 <= waited <= KEEP_ALIVE / 2 + 3,
+            "first PINGREQ after ~%d s (took %.1f s)" % (KEEP_ALIVE / 2, waited),
+        )
+        conn.sendall(bytes([PINGRESP << 4, 0]))
+        t_response = time.monotonic()
+
+        # Answered ping: still connected, pings again, then we go silent.
+        t_ping2 = wait_for(conn, PINGREQ, KEEP_ALIVE)
+        if not s.check(t_ping2 is not None, "stays connected and pings again"):
+            return
+
+        t_closed = wait_closed(conn, KEEP_ALIVE + 10)
+        if not s.check(t_closed is not None, "closes when the broker stops answering"):
+            return
+        waited = t_closed - t_response
+        s.check(
+            KEEP_ALIVE - 2 <= waited <= KEEP_ALIVE + 3,
+            "closes ~%d s after the last response (took %.1f s)" % (KEEP_ALIVE, waited),
+        )
+    except Closed:
+        s.check(False, "connection closed unexpectedly early")
+        return
+    finally:
+        conn.close()
+    conn, _ = connect(broker, s, "reconnect")
+    if conn:
+        conn.close()
+
+
 SCENARIOS = {
     "connack_timeout": connack_timeout,
     "connack_rejected": connack_rejected,
+    "keepalive": keepalive,
 }
 
 

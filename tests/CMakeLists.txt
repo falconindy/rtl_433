@@ -149,7 +149,8 @@ if(UNIX)
         message(STATUS "Skipping http_server_integration test (need sh and curl)")
     endif()
     # Black-box test of the MQTT client against a scripted fake broker that
-    # doesn't accept the connection.
+    # stops answering. The keepalive scenario waits out the 60 s keep-alive,
+    # so it runs as its own test.
     if(PYTHON3_PROGRAM)
         add_test(
             NAME mqtt_reconnect
@@ -157,6 +158,13 @@ if(UNIX)
                 ${CMAKE_CURRENT_SOURCE_DIR}/mqtt-reconnect-test.py
                 $<TARGET_FILE:rtl_433>
                 connack_timeout connack_rejected)
+        add_test(
+            NAME mqtt_keepalive
+            COMMAND ${PYTHON3_PROGRAM}
+                ${CMAKE_CURRENT_SOURCE_DIR}/mqtt-reconnect-test.py
+                $<TARGET_FILE:rtl_433>
+                keepalive)
+        set_tests_properties(mqtt_keepalive PROPERTIES TIMEOUT 180)
     else()
         message(STATUS "Skipping mqtt_reconnect tests (need python3)")
     endif()

@@ -155,8 +155,9 @@ typedef struct mqtt_client {
     int publish_flags; // MG_MQTT_RETAIN | MG_MQTT_QOS(0)
     unsigned qos;
     inflight_t inflight;
-    int connack_ok;      // CONNACK accepted on the current connection
-    double connect_time; // when the current TCP connection came up
+    int connack_ok;   // CONNACK accepted on the current connection
+    double last_recv; // time of the last packet from the broker, or of connecting
+    double last_ping; // time we last sent a PINGREQ
 } mqtt_client_t;
 
 // Seconds to wait for a CONNACK after the TCP connection is up.
@@ -175,6 +176,14 @@ static void mqtt_client_event(struct mg_connection *nc, int ev, void *ev_data)
     //if (ev != MG_EV_POLL)
     //    fprintf(stderr, "MQTT user handler got event %d\n", ev);
 
+    // Any packet from the broker shows the connection is alive
+    if (ev >= MG_MQTT_EVENT_BASE) {
+        if (!ctx) {
+            return; // shutting down
+        }
+        ctx->last_recv = mg_time();
+    }
+
     switch (ev) {
     case MG_EV_CONNECT: {
         int connect_status = *(int *)ev_data;
@@ -185,8 +194,9 @@ static void mqtt_client_event(struct mg_connection *nc, int ev, void *ev_data)
             if (ctx) {
                 // Don't reset reconnect_delay yet: a local proxy may accept the
                 // TCP connection even when the broker is unreachable.
-                ctx->connack_ok   = 0;
-                ctx->connect_time = mg_time();
+                ctx->connack_ok = 0;
+                ctx->last_recv  = mg_time();
+                ctx->last_ping  = ctx->last_recv;
                 mg_send_mqtt_handshake_opt(nc, ctx->client_id, ctx->mqtt_opts);
 
                 // Send us MG_EV_TIMER event after 500 milliseconds
@@ -323,13 +333,24 @@ static void mqtt_client_timer(struct mg_connection *nc, int ev, void *ev_data)
                 break;
             }
 
-            // Drop a connection that never got a CONNACK, e.g. when a proxy
-            // accepted the TCP connection but has no route to the broker.
-            // MG_EV_CLOSE then reconnects.
-            if (!ctx->connack_ok && now - ctx->connect_time > MQTT_CONNACK_TIMEOUT) {
+            // Drop a connection the broker stopped answering, e.g. when a
+            // proxy accepted the TCP connection but has no route to the broker,
+            // or the network path silently died. MG_EV_CLOSE then reconnects.
+            int keep_alive = ctx->mqtt_opts.keep_alive ? ctx->mqtt_opts.keep_alive : 60;
+            if (!ctx->connack_ok && now - ctx->last_recv > MQTT_CONNACK_TIMEOUT) {
                 print_logf(LOG_WARNING, "MQTT", "MQTT no CONNACK from broker in %d seconds", MQTT_CONNACK_TIMEOUT);
                 ctx->conn->flags |= MG_F_CLOSE_IMMEDIATELY;
                 break;
+            }
+            if (ctx->connack_ok && now - ctx->last_recv > keep_alive) {
+                print_logf(LOG_WARNING, "MQTT", "MQTT no response from broker in %d seconds", keep_alive);
+                ctx->conn->flags |= MG_F_CLOSE_IMMEDIATELY;
+                break;
+            }
+            // Publishes don't get a response with QoS 0, ping to get one.
+            if (ctx->connack_ok && now - ctx->last_ping >= keep_alive / 2) {
+                mg_mqtt_ping(ctx->conn);
+                ctx->last_ping = now;
             }
 
             // check inflight...
